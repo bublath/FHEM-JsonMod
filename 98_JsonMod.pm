@@ -16,6 +16,7 @@
 #     You should have received a copy of the GNU General Public License
 #     along with fhem.  If not, see <http://www.gnu.org/licenses/>.
 #
+#     Extension to run this as a server by Adimarantis
 #
 ###############################################################################
 
@@ -44,7 +45,6 @@ no warnings qw( experimental::lexical_subs );
 
 sub JsonMod_Initialize {
 	my ($hash) = @_;
-
 	my @attrList;
 	{
 		no warnings qw( qw );
@@ -63,6 +63,7 @@ sub JsonMod_Initialize {
 	$hash->{'DeleteFn'}				= 'JsonMod_Delete';
 	$hash->{'SetFn'}				= 'JsonMod_Set';
 	$hash->{'AttrFn'}				= 'JsonMod_Attr';
+	$hash->{'ReadFn'}				= 'JsonMod_Read';
 	#$hash->{'NotifyFn'}				= 'JsonMod_Notify';
 	$hash->{'AttrList'}				= join(' ', @attrList)." $readingFnAttributes ";
 
@@ -71,7 +72,7 @@ sub JsonMod_Initialize {
 
 sub JsonMod_Define {
 	my ($hash, $def) = @_;
-	my ($name, $type, $source) = split /\s/, $def, 3;
+	my ($name, $type, $source, $global) = split /\s/, $def, 4;
 
 	my $cvsid = '$Id: 98_JsonMod.pm 28481 2024-02-05 22:14:33Z herrmannj $';
 	$cvsid =~ s/^.*pm\s//;
@@ -79,22 +80,89 @@ sub JsonMod_Define {
 	$hash->{'SVN'} = $cvsid;
 	$hash->{'CONFIG'}->{'IN_REQUEST'} = 0;
 	$hash->{'CONFIG'}->{'CRON'} = \'0 * * * *';
+	$hash->{'Servermode'} = 0;
 	# $hash->{'CRON'} = JsonMod::Cron->new();
 
 	return "no FUUID, is fhem up to date?" if (not $hash->{'FUUID'});
-	return "wrong source definition" if ($source !~ m/^(https:|http:|file:|system:)/);
 
-	$hash->{'CONFIG'}->{'SOURCE'} = $source;
-	#($hash->{'NOTIFYDEV'}) = devspec2array('TYPE=Global');
-	InternalTimer(0, \&JsonMod_Run, $hash);
+    if($source !~ m/^(IPV6:)?\d+$/) {
+		#Standard usage as client
+		return "wrong source definition" if ($source !~ m/^(https:|http:|file:|system:)/);
+		$hash->{'CONFIG'}->{'SOURCE'} = $source;
+		InternalTimer(0, \&JsonMod_Run, $hash);
+	} else {
+		$hash->{'Servermode'} = 1;
+		return JsonMod_InitServer($hash,$source,$global);
+	}
 	return;
 };
+
+sub JsonMod_InitServer {
+	my ($hash, $source, $global) = @_;
+
+	my $name=$hash->{NAME};
+	my $ret = TcpServer_Open($hash, $source, $global);
+	if($ret && !$init_done) {
+		Log3 $name, 1, "$ret. Exiting.";
+		exit(1);
+	}
+	$hash->{'CONFIG'}->{'PORT'} = $source;
+	$hash->{'CONFIG'}->{'GLOBAL'} = $global;
+	return $ret;
+}
+
+sub JsonMod_Read($) {
+	my ($hash) = @_;
+
+	if($hash->{SERVERSOCKET}) {   # Accept and create a child
+		my $nhash = TcpServer_Accept($hash, "JsonMod");
+		$nhash->{Servermode}=1;
+		return if(!$nhash);
+		$nhash->{CD}->blocking(0);
+		return;
+	}
+
+	my $sname = $hash->{SNAME};
+	my $shash = $defs{$sname};
+	my $cname = $hash->{NAME};
+
+	my $buf;
+	my $ret = sysread($hash->{CD}, $buf, 256);
+	$hash->{BUF}.=$buf;
+
+	my $len=length($buf);
+	Log3 $sname, 3, "Received $len characters";
+	Log3 $sname, 5, "Received data: $buf" if ($len>0);
+
+	if(!defined($ret) || $ret <= 0) {
+		#remove possible noise at beginning and end
+		my $newbuf=$hash->{BUF};
+		$newbuf=~/(\{.*\}).*$/;
+		my $json = JsonMod::JSON::StreamReader->new()->parse($1);
+		if (not $json or ((ref($json) ne 'HASH') and ref($json) ne 'ARRAY')) {
+			print $json;
+			readingsSingleUpdate($shash, 'state', $json, 1);
+		} else {
+			JsonMod_DoReadings($shash, $json);
+		}
+		CommandDelete(undef, $cname);
+		return;
+	}
+
+	if(ord($buf) == 4) {	# EOT / ^D
+		CommandQuit($hash, "");
+	return;	
+	}
+	
+	return;
+}
 
 # reread / temporary remove
 sub JsonMod_Undef {
 	my ($hash, $name) = @_;
+	TcpServer_Close($hash) if ($hash->{Servermode} == 1);
 	#RemoveInternalTimer($hash, \&JsonMod_DoTimer);
-	JsonMod_StopTimer($hash);
+	JsonMod_StopTimer($hash) if ($hash->{Servermode} == 0);
 	return;
 };
 
@@ -103,7 +171,7 @@ sub JsonMod_Delete {
 	my ($hash, $name) = @_;
 	my $error;
 	# remove secret
-	setKeyValue($hash->{'FUUID'}, undef);
+	setKeyValue($hash->{'FUUID'}, undef) if ($hash->{Servermode} == 0);
 	return $error;
 };
 
@@ -147,7 +215,8 @@ sub JsonMod_Set {
 		return 'request already pending' if ($hash->{'CONFIG'}->{'IN_REQUEST'});
 		JsonMod_ApiRequest($hash);
 		return;
-	};
+	}
+	;
 
 	return;
 };
@@ -1659,6 +1728,7 @@ sub DESTROY {
 <ul>
 	JsonMod provides a generic way to load and parse json files from HTTP sources periodically. 
 	Elements within the json files can be selected and displayed in a targeted manner.
+	Alternatively this module can also run in server mode, accepting connections on a specific port and expecting JSON formed input that will then be translated into readings.
 	<br><br>
 	JsonMod uses the JsonPath syntax to access elements or lists within the json file.
 	The well-known cron syntax is used for the periodic retrieval of the files.
@@ -1667,13 +1737,15 @@ sub DESTROY {
 	<a name="JsonModdefine"></a>
 	<b>Define</b>
 	<ul>
-    	<code>define &lt;name&gt; JsonMod &lt;http[s]:example.com:/somepath/somefile.json&gt;</code>
+    	<code>define &lt;name&gt; JsonMod &lt;http[s]:example.com:/somepath/somefile.json&gt;</code><br>
+    	<code>define &lt;name&gt; JsonMod &lt;port&gt [&lt;global&gt;]</code>
     	<br><br>
     	defines the device and set the source (file:|http:|https:|system://).<br>
+		or define a port number plus the optional "global" keyword (to accept connections from anywhere) to set into server mode. <br>
 		<br>files example:
 		<ul>
 		<li>file:[//]/path/file (absolute)</li>
-		<li>file:[//]path/file (realtive)</li>
+		<li>file:[//]path/file (relative)</li>
 		</ul>
 		<br>system example:
 		<ul>
